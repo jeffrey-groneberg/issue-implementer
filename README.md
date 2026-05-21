@@ -1,5 +1,11 @@
 # 🤖 Copilot Issue Agent
 
+> 📱 **Scan to open this repo** — share with session participants:
+>
+> <img src="docs/repo-qr.png" alt="QR code for https://github.com/jeffrey-groneberg/issue-implementer" width="180" />
+>
+> <https://github.com/jeffrey-groneberg/issue-implementer>
+
 **Label-to-PR Autopilot** — A GitHub Composite Action that turns issues into pull requests using the GitHub Copilot SDK. Add a label to an issue, get an implementation plan, refine it through conversation, and let the agent implement the code and open a draft PR.
 
 ## Why This Exists
@@ -135,7 +141,7 @@ The action handles all event filtering internally — it detects the mode (plan,
 
 ### 5. Try It Out
 
-Labels are **created automatically** on the first run. The action ensures these labels exist:
+The action ensures these labels exist and creates any that are missing on every run:
 
 | Label | Purpose |
 |-------|---------|
@@ -144,6 +150,27 @@ Labels are **created automatically** on the first run. The action ensures these 
 | `copilot:working` | Set by agent during implementation |
 | `copilot:review` | Set by agent after opening a PR |
 | `copilot:failed` | Set by agent on errors |
+
+#### Bootstrap the trigger label
+
+There's a small chicken-and-egg problem: the workflow only fires when an issue is
+labeled `copilot`, but on a fresh repo that label doesn't exist yet — so you can't
+attach it from the CLI, and the action can't auto-create it until *after* its first
+run. The remaining `copilot:*` labels are created by the action itself once it
+runs, so you only need to bootstrap `copilot`.
+
+Run this once per repo to create it:
+
+```bash
+gh label create copilot \
+  --color 0e8a16 \
+  --description "Trigger label for Copilot Issue Agent" \
+  --repo <owner>/<repo>
+```
+
+> 💡 If you create the issue in the GitHub web UI you can type `copilot` into the
+> label picker and it will offer to create it inline — in that case you can skip
+> the command above.
 
 To get started:
 
