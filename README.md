@@ -88,6 +88,7 @@ The SDK downloads its pinned runtime from GitHub releases. Runners without acces
 The agent operates in a **plan → refine → implement** loop driven by labels and issue comments:
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 320}}}%%
 flowchart TD
     A["🏷️ Label issue with <b>copilot</b>"] --> B["🧭 issue-planner reads the issue + codebase"]
     B --> C["📋 submit_plan → the action posts the plan"]
@@ -119,20 +120,16 @@ Only repository owners, organization members and collaborators can drive the age
 Every issue event starts one workflow run. The composite action ([`action.yml`](action.yml)) decides what to do and prepares only what that mode needs:
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 320}}}%%
 flowchart TD
-    EV(["📨 Issue event: label added or comment created"]) --> DM{"🔎 Detect mode<br/>state, labels, author, command"}
-    DM -->|"skip"| SK(["⏭️ Done, no agent"])
-    DM -->|"cancel"| CA["🚫 Remove copilot labels, post a notice"]
-    DM -->|"plan · refine · implement"| PY["🐍 Private Python 3.12 venv<br/>microsoft-copilot-sdk 2.0.1 + runtime"]
-    PY --> SB{"implement?"}
-    SB -->|"yes"| BW["🧱 Prepare the sandbox<br/>bubblewrap check on Linux"]
-    SB -->|"no"| RS
-    BW --> RS{"refine or<br/>implement?"}
-    RS -->|"yes"| RC["♻️ Restore the issue's session<br/>actions/cache"]
-    RS -->|"no, plan"| AG
-    RC --> AG["🤖 scripts/agent.py runs the phase"]
-    AG --> SV["💾 Save the session<br/>actions/cache"]
-
+    EV(["📨 Issue event: label added or comment created"]) --> DM{"🔎 Detect mode"}
+    DM -->|"skip"| SK(["⏭️ Nothing to do"])
+    DM -->|"cancel"| CA["🚫 Remove the copilot labels,<br/>post a notice"]
+    DM -->|"plan · refine · implement"| RUN
+    subgraph RUN["Composite action steps"]
+        direction LR
+        PY["🐍 Install SDK 2.0.1<br/>+ runtime"] --> BW["🧱 Check the sandbox<br/><i>implement only</i>"] --> RC["♻️ Restore the session<br/><i>refine, implement</i>"] --> AG["🤖 agent.py"] --> SV["💾 Save the session"]
+    end
     style AG fill:#1f6feb,color:#fff
     style BW fill:#8957e5,color:#fff
 ```
@@ -168,6 +165,7 @@ sequenceDiagram
 The action defines two custom agents with `agents.definitions`. Both live in every session, so a resumed conversation always knows them; each phase selects the one it needs. A new session selects it with `agents.selected`. A resumed session keeps the agent it last used, so the action switches with `session.rpc.agent.select(...)`.
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 320}}}%%
 flowchart LR
     L["🏷️ Label copilot"] -->|"create_session<br/>agents.selected"| P
     F["💬 Feedback comment"] -->|"resume_session<br/>agent.select"| P
@@ -179,7 +177,7 @@ flowchart LR
     end
 
     P -->|"submit_plan"| PC["📋 The action posts the plan"]
-    M -->|"submit_pull_request"| PR["🚀 The action commits, pushes<br/>and opens a draft PR"]
+    M -->|"submit_pull_request"| PR["🚀 The action opens<br/>the draft PR"]
     RI["📄 .github/copilot-instructions.md<br/>AGENTS.md"] -.->|"apply to both agents"| S
 
     style P fill:#1f6feb,color:#fff
@@ -253,15 +251,16 @@ The client runs in `mode="empty"`, so a session has no tools unless it opts in. 
 `permissions.sandbox` (experimental) runs the implementer's shell in the runtime's sandbox, built from the action's [`sandbox_config`](scripts/copilot_session.py): the repository is writable, `.git/` and `.github/workflows/` are read-only, there is no outbound or local network access, and `allow_bypass=False`. The planner has no shell, so it needs no sandbox.
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 320}}}%%
 flowchart LR
     subgraph SB["🧱 Sandbox: bubblewrap on Linux, Seatbelt on macOS"]
         SH["💻 The implementer's bash<br/>pytest · git status · git restore"]
     end
     SH -->|"✅ read and write"| WT["📁 Repository working tree"]
     SH -->|"👁️ read only"| RO["🔒 .git/ and .github/workflows/"]
-    SH -.->|"❌ no DNS, no network"| NET["🌐 Internet and localhost"]
-    SH -.->|"❌ not in the environment"| TOK["🔑 GITHUB_TOKEN and Copilot token"]
     SH -.->|"❌ hidden"| HOME["🏠 ~/.config, ~/.docker, ~/.ssh,<br/>the runner's own directory"]
+    SH -.->|"❌ not in the environment"| TOK["🔑 GITHUB_TOKEN and Copilot token"]
+    SH -.->|"❌ no DNS, no network"| NET["🌐 Internet, localhost"]
 
     style SB stroke:#8957e5,stroke-width:2px
 ```
@@ -286,29 +285,23 @@ Because the sandbox has no network, install what your tests need before the acti
 
 ### Around the Agent
 
-The agent's commands run in the sandbox; the credentials stay in the action's process, and only deterministic code uses them:
+The agent's commands run in the sandbox; the credentials stay in the action's process, and only deterministic code uses them. All three work on the same checkout: the runtime's file tools through the permission policy, the shell inside the sandbox, and `agent.py` only after the agent has finished:
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 320}}}%%
 flowchart TB
-    subgraph RUN["🖥️ Runner"]
-        subgraph ACT["🐍 Action process: trusted, holds the tokens"]
-            AG["agent.py<br/>GITHUB_TOKEN for gh and git"]
-            PO["Permission policy<br/>permissions.on_request"]
-            RT["Copilot runtime, in-process<br/>Copilot token per session"]
-        end
-        subgraph SBX["🧱 Sandbox: untrusted, no tokens"]
-            SH["The agent's shell commands"]
-        end
-        WT[("📁 Working tree")]
+    CP["☁️ Copilot API"]
+    GH["🐙 GitHub API"]
+    subgraph ACT["🐍 Action process: trusted, holds the tokens"]
+        RT["🤖 Copilot runtime, in-process<br/>Copilot token per session<br/>🛡️ permission policy on every read, write, shell"]
+        AG["⚙️ agent.py<br/>GITHUB_TOKEN"]
     end
-    RT <-->|"every read, write, shell"| PO
-    RT -->|"view · edit · create"| WT
+    subgraph SBX["🧱 Sandbox: untrusted, no tokens, no network"]
+        SH["💻 The agent's shell commands"]
+    end
+    CP <-->|"model requests"| RT
+    GH <-->|"comments · labels<br/>commit · push · draft PR"| AG
     RT -->|"bash"| SH
-    SH --> WT
-    AG -->|"checks, then commit and push<br/>with hooks disabled"| WT
-    AG -->|"comments · labels · draft PR"| GH["🐙 GitHub API"]
-    RT -->|"model requests"| CP["☁️ Copilot API"]
-
     style ACT stroke:#1f6feb,stroke-width:2px
     style SBX stroke:#8957e5,stroke-width:2px
 ```
