@@ -89,12 +89,12 @@ The agent operates in a **plan → refine → implement** loop driven by labels 
 
 ```mermaid
 flowchart TD
-    A["🏷️ Label issue with <b>copilot</b>"] --> B["🔍 issue-planner reads the issue + codebase"]
+    A["🏷️ Label issue with <b>copilot</b>"] --> B["🧭 issue-planner reads the issue + codebase"]
     B --> C["📋 submit_plan → the action posts the plan"]
     C --> D{"👀 You review the plan"}
     D -->|"💬 Comment with feedback"| E["🔄 Same session resumes, plan is refined"]
     E --> D
-    D -->|"✅ /implement"| F["⚙️ issue-implementer codes and tests in the sandbox,<br/>submit_pull_request → the action opens a draft PR"]
+    D -->|"✅ /implement"| F["🛠️ issue-implementer codes and tests in the sandbox,<br/>submit_pull_request → the action opens a draft PR"]
     D -->|"🚫 /cancel"| G["🛑 Agent stops, labels removed"]
 
     style A fill:#238636,color:#fff
@@ -114,24 +114,232 @@ flowchart TD
 
 Only repository owners, organization members and collaborators can drive the agent with comments. Everyone else's comments are ignored, so nobody can spend your AI credits through a drive-by comment.
 
-### Inside One Run
+### One Run, Step by Step
+
+Every issue event starts one workflow run. The composite action ([`action.yml`](action.yml)) decides what to do and prepares only what that mode needs:
+
+```mermaid
+flowchart TD
+    EV(["📨 Issue event: label added or comment created"]) --> DM{"🔎 Detect mode<br/>state, labels, author, command"}
+    DM -->|"skip"| SK(["⏭️ Done, no agent"])
+    DM -->|"cancel"| CA["🚫 Remove copilot labels, post a notice"]
+    DM -->|"plan · refine · implement"| PY["🐍 Private Python 3.12 venv<br/>microsoft-copilot-sdk 2.0.1 + runtime"]
+    PY --> SB{"implement?"}
+    SB -->|"yes"| BW["🧱 Prepare the sandbox<br/>bubblewrap check on Linux"]
+    SB -->|"no"| RS
+    BW --> RS{"refine or<br/>implement?"}
+    RS -->|"yes"| RC["♻️ Restore the issue's session<br/>actions/cache"]
+    RS -->|"no, plan"| AG
+    RC --> AG["🤖 scripts/agent.py runs the phase"]
+    AG --> SV["💾 Save the session<br/>actions/cache"]
+
+    style AG fill:#1f6feb,color:#fff
+    style BW fill:#8957e5,color:#fff
+```
+
+### Inside the Agent Run
 
 The agent decides; the action acts. Every GitHub side effect (reactions, labels, comments, branch, commit, pull request) is plain Python in [`scripts/agent.py`](scripts/agent.py), and every SDK call is in [`scripts/copilot_session.py`](scripts/copilot_session.py):
 
 ```mermaid
 sequenceDiagram
-    participant GH as GitHub issue
-    participant A as Action (agent.py)
+    autonumber
+    participant GH as GitHub
+    participant A as agent.py
     participant R as Copilot runtime (in-process)
-    GH->>A: issues / issue_comment event
-    A->>GH: 👀 reaction, read issue and latest plan
-    A->>R: resume_session("copilot-issue-N") or create_session
-    A->>R: send_and_wait(prompt with issue, feedback or plan)
-    R->>R: view / glob / grep / edit / bash<br/>(tool allow-list, permission policy, sandbox)
-    R->>A: submit_plan or submit_pull_request (terminal custom tool)
+    participant S as Sandbox
+    GH->>A: issue event
+    A->>GH: 👀 reaction, read the issue and the latest plan
+    A->>R: create_session or resume_session("copilot-issue-N")
+    A->>R: select the phase's agent
+    A->>R: send_and_wait(issue, feedback or plan)
+    loop until the agent submits
+        R->>A: permission request (read, write, shell)
+        A-->>R: approve or reject with a reason
+        R->>S: bash: tests, git status (implement only)
+    end
+    R->>A: submit_plan or submit_pull_request
     A->>R: session.rpc.usage.get_metrics()
     A->>GH: plan comment, or commit + push + draft PR, labels, AI credits
 ```
+
+## Custom Agents
+
+The action defines two custom agents with `agents.definitions`. Both live in every session, so a resumed conversation always knows them; each phase selects the one it needs. A new session selects it with `agents.selected`. A resumed session keeps the agent it last used, so the action switches with `session.rpc.agent.select(...)`.
+
+```mermaid
+flowchart LR
+    L["🏷️ Label copilot"] -->|"create_session<br/>agents.selected"| P
+    F["💬 Feedback comment"] -->|"resume_session<br/>agent.select"| P
+    I["✅ /implement"] -->|"resume_session<br/>agent.select"| M
+
+    subgraph S["💬 One Copilot session per issue: copilot-issue-N"]
+        P["🧭 <b>issue-planner</b><br/>read-only<br/>view · glob · grep<br/>skill: issue-planner"]
+        M["🛠️ <b>issue-implementer</b><br/>view · glob · grep<br/>create · edit · apply_patch<br/>bash, only in the sandbox<br/>skill: issue-implementer"]
+    end
+
+    P -->|"submit_plan"| PC["📋 The action posts the plan"]
+    M -->|"submit_pull_request"| PR["🚀 The action commits, pushes<br/>and opens a draft PR"]
+    RI["📄 .github/copilot-instructions.md<br/>AGENTS.md"] -.->|"apply to both agents"| S
+
+    style P fill:#1f6feb,color:#fff
+    style M fill:#8957e5,color:#fff
+```
+
+| | `issue-planner` | `issue-implementer` |
+|---|---|---|
+| Phases | plan, refine | implement |
+| Built-in tools | `view`, `glob`, `grep` | `view`, `glob`, `grep`, `create`, `edit`, `apply_patch`, and `bash` when the sandbox is available |
+| Custom tool | `submit_plan` | `submit_pull_request` |
+| Preloaded skill | [`issue-planner`](skills/issue-planner/SKILL.md): plan format and rules | [`issue-implementer`](skills/issue-implementer/SKILL.md): implementation rules and PR summary |
+| Hands back | The complete plan | Title, commit message, summary, test results |
+| Then the action | Posts the plan comment | Checks the changes, commits, pushes, opens the draft PR |
+
+How the pieces fit together, simplified from [`copilot_session.py`](scripts/copilot_session.py):
+
+```python
+await client.create_session(
+    session_id="copilot-issue-42",
+    agents={"definitions": [planner, implementer],  # each with its own "tools" and "skills"
+            "selected": "issue-planner",
+            "included_builtin_agents": []},          # no built-in sub-agents
+    skills={"enabled": True, "directories": ["skills"]},
+    instructions={"skip_custom_instructions": False}, # the repository's Copilot instructions
+    tools={"definitions": [submit_plan],              # define_tool(..., is_terminal=True)
+           "available_tools": ToolSet().add_builtin(["view", "glob", "grep"])
+                                       .add_custom("submit_plan")},
+    ...
+)
+```
+
+- **Least privilege per agent**: the session's `tools.available_tools` is exactly the selected agent's tool list, so the planner cannot edit files or run commands.
+- **No surprise delegation**: `infer: False` keeps the runtime from handing work to an agent on its own, and `included_builtin_agents=[]` disables the built-in sub-agents.
+- **Terminal custom tools**: `submit_plan` and `submit_pull_request` are defined with `is_terminal=True` (a successful call ends the turn) and `skip_permission=True` (the action owns them). They only validate and record the result; if a check fails, for example too many changed files, the agent gets the reason and can fix it.
+- **Skills and instructions**: each agent preloads its skill from [`skills/`](skills), and both follow the repository's own `.github/copilot-instructions.md` or `AGENTS.md`.
+
+## Sandboxing and Guardrails
+
+Guardrails come in three layers, all provided by the SDK. Each layer blocks on its own; together they assume the model can be wrong or manipulated by issue content. This is the path every tool call takes:
+
+```mermaid
+flowchart LR
+    M["🧠 The model wants<br/>to call a tool"] --> E{"1️⃣ Exposure<br/>Is the tool in the<br/>agent's allow-list?"}
+    E -->|"no"| X1["❌ The tool does not exist"]
+    E -->|"yes"| A{"2️⃣ Approval<br/>permissions.on_request<br/>read · write · shell"}
+    A -->|"reject"| X2["❌ Rejected; the model<br/>gets the reason"]
+    A -->|"approve"| C["3️⃣ Containment<br/>shell commands run<br/>in the sandbox"]
+    C --> OK["✅ Result back<br/>to the model"]
+
+    style E fill:#1f6feb,color:#fff
+    style A fill:#d29922,color:#fff
+    style C fill:#8957e5,color:#fff
+```
+
+### 1. Exposure: Which Tools Exist
+
+The client runs in `mode="empty"`, so a session has no tools unless it opts in. The session's `tools.available_tools` allow-list contains exactly the selected agent's tools (see [Custom Agents](#custom-agents)): planning is read-only, and no tool can reach GitHub. The two custom tools only validate and record the result; the action does the GitHub work after the session ends.
+
+### 2. Approval: What Each Request May Do
+
+`permissions.on_request` receives typed requests from the runtime and approves or rejects each one ([`denial_reason`](scripts/copilot_session.py)):
+
+- **Read**: only files in the repository and the action's skills
+- **Write**: only files in the repository, never `.git/` or `.github/workflows/`, checked for every file of a multi-file edit and after resolving symlinks
+- **Shell**: only when the sandbox is on, and never a request to leave it
+- **Everything else** (URLs, MCP, memory and so on) and anything that needs a person's approval: rejected
+
+### 3. Containment: The Sandbox
+
+`permissions.sandbox` (experimental) runs the implementer's shell in the runtime's sandbox, built from the action's [`sandbox_config`](scripts/copilot_session.py): the repository is writable, `.git/` and `.github/workflows/` are read-only, there is no outbound or local network access, and `allow_bypass=False`. The planner has no shell, so it needs no sandbox.
+
+```mermaid
+flowchart LR
+    subgraph SB["🧱 Sandbox: bubblewrap on Linux, Seatbelt on macOS"]
+        SH["💻 The implementer's bash<br/>pytest · git status · git restore"]
+    end
+    SH -->|"✅ read and write"| WT["📁 Repository working tree"]
+    SH -->|"👁️ read only"| RO["🔒 .git/ and .github/workflows/"]
+    SH -.->|"❌ no DNS, no network"| NET["🌐 Internet and localhost"]
+    SH -.->|"❌ not in the environment"| TOK["🔑 GITHUB_TOKEN and Copilot token"]
+    SH -.->|"❌ hidden"| HOME["🏠 ~/.config, ~/.docker, ~/.ssh,<br/>the runner's own directory"]
+
+    style SB stroke:#8957e5,stroke-width:2px
+```
+
+Verified by running commands through the agent's sandboxed shell with the action's own configuration (`session.rpc.shell.execute_user_requested`, no model involved):
+
+| Inside the sandbox | `ubuntu-latest` runner (bubblewrap 0.11.1) | macOS (Seatbelt) |
+|---|---|---|
+| `git status`, writing a file in the repository | ✅ works | ✅ works |
+| Writing to `.git/` or `.github/workflows/` | ❌ `Read-only file system` | ❌ `Operation not permitted` |
+| `curl https://api.github.com` | ❌ `Could not resolve host` | ❌ `Could not resolve host` |
+| Token or secret variables in `env` | none | none |
+| Home directory | only `.cache`, `.cargo`, `.dotnet`, `.local` and `work` visible | not readable |
+
+**No sandbox, no shell**: where the sandbox is unavailable, the implementer gets no `bash` tool and cannot run tests.
+
+- **Linux**: bubblewrap 0.5.0 or later. `ubuntu-latest` ships it; elsewhere the action installs it, lifts Ubuntu 24.04's AppArmor restriction on unprivileged user namespaces when necessary, and checks that bubblewrap works.
+- **macOS**: the built-in Seatbelt sandbox.
+- **Windows or a failed check**: no sandbox, so no shell; the log and the job summary say so.
+
+Because the sandbox has no network, install what your tests need before the action runs (see the [workflow example](#1-create-the-workflow-file)).
+
+### Around the Agent
+
+The agent's commands run in the sandbox; the credentials stay in the action's process, and only deterministic code uses them:
+
+```mermaid
+flowchart TB
+    subgraph RUN["🖥️ Runner"]
+        subgraph ACT["🐍 Action process: trusted, holds the tokens"]
+            AG["agent.py<br/>GITHUB_TOKEN for gh and git"]
+            PO["Permission policy<br/>permissions.on_request"]
+            RT["Copilot runtime, in-process<br/>Copilot token per session"]
+        end
+        subgraph SBX["🧱 Sandbox: untrusted, no tokens"]
+            SH["The agent's shell commands"]
+        end
+        WT[("📁 Working tree")]
+    end
+    RT <-->|"every read, write, shell"| PO
+    RT -->|"view · edit · create"| WT
+    RT -->|"bash"| SH
+    SH --> WT
+    AG -->|"checks, then commit and push<br/>with hooks disabled"| WT
+    AG -->|"comments · labels · draft PR"| GH["🐙 GitHub API"]
+    RT -->|"model requests"| CP["☁️ Copilot API"]
+
+    style ACT stroke:#1f6feb,stroke-width:2px
+    style SBX stroke:#8957e5,stroke-width:2px
+```
+
+- **No token in the agent's reach**: before the in-process runtime starts, credentials are removed from the process environment, and the action removes any credential `actions/checkout` persisted in `.git/config`. The Copilot token is passed per session rather than to the client, because the SDK hands a client-level token to the in-process runtime as an environment variable that the agent's shell would inherit. The GitHub token only reaches the `gh` and `git` processes that need it.
+- **Publishing checks**: the action stages the changes itself and refuses empty changes, workflow files (renames included) and more than `max-files-changed` files. It refuses to publish if the repository's git configuration changed during the run, and runs git with hooks disabled.
+- **Untrusted input**: issue text, comments and feedback are fenced as user content in the prompts, and only plans posted by the action itself count, so nobody can forge a plan comment.
+- **Loop protection**: every comment the action posts carries a marker, and the action ignores comments with that marker, even when `github-token` is a personal token.
+- **Budget and time**: `max-ai-credits` sets a soft cap per session (checked between model calls, so one response can exceed it; the runtime also tells the model its budget). If the budget runs out, the action answers the runtime's request with *cancel*. `timeout-minutes` bounds every run.
+
+## Durable Sessions
+
+Each issue has one Copilot session, `copilot-issue-<number>`. The plan phase creates it with `create_session(session_id=...)`; refine and implement continue it with `resume_session(...)` and switch to their agent with `session.rpc.agent.select(...)`, so the implementer starts with everything the planner learned. Between workflow runs, the session state (`<runner temp>/copilot-agent-home/session-state`) is stored with `actions/cache`, which needs `cache-mode: write` in the workflow.
+
+```mermaid
+sequenceDiagram
+    participant C as actions/cache
+    participant P as Run 1 · plan
+    participant F as Run 2 · refine
+    participant I as Run 3 · implement
+    P->>P: create_session("copilot-issue-N"), issue-planner
+    P->>C: save the session state
+    C->>F: restore
+    F->>F: resume_session + agent.select(issue-planner)
+    F->>C: save
+    C->>I: restore
+    I->>I: resume_session + agent.select(issue-implementer)
+    I->>C: save
+```
+
+If the cache is missing (no `cache-mode: write`, or eviction after 7 days without access), the agent starts a fresh session with the issue in the prompt. Nothing breaks: the latest plan is always part of the prompt.
 
 ## Quick Start
 
@@ -291,54 +499,6 @@ There is no config file. Tell the agent about your project the way you tell any 
 - Python 3.12. Add type hints to every function signature.
 - Tests use pytest and live in `tests/`. Run them with `python -m pytest -q`.
 ```
-
-## Safety Guardrails
-
-Guardrails come in three layers, all provided by the SDK. Each layer blocks on its own; together they assume the model can be wrong or manipulated by issue content.
-
-### 1. Exposure: Which Tools Exist
-
-The client runs in `mode="empty"`, so a session has no tools unless it opts in. Each custom agent has its own tool list, and the session's `tools.available_tools` allow-list contains exactly the selected agent's tools:
-
-| Agent | Built-in tools | Custom tool |
-|---|---|---|
-| `issue-planner` (plan, refine) | `view`, `glob`, `grep` | `submit_plan` |
-| `issue-implementer` (implement) | `view`, `glob`, `grep`, `create`, `edit`, `apply_patch`, `bash` (only with the sandbox) | `submit_pull_request` |
-
-Planning is read-only. Built-in sub-agents are disabled (`agents.included_builtin_agents=[]`). No tool can reach GitHub: the two custom tools only validate and record the result, and the action does the GitHub work after the session ends.
-
-### 2. Approval: What Each Request May Do
-
-`permissions.on_request` receives typed requests from the runtime and approves or rejects each one ([`denial_reason`](scripts/copilot_session.py)):
-
-- **Read**: only files in the repository and the action's skills
-- **Write**: only files in the repository, never `.git/` or `.github/workflows/`, checked for every file of a multi-file edit and after resolving symlinks
-- **Shell**: only when the sandbox is on, and never a request to leave it
-- **Everything else** (URLs, MCP, memory and so on) and anything that needs a person's approval: rejected
-
-### 3. Containment: Sandbox
-
-`permissions.sandbox` (experimental) runs the implementer's shell in the runtime's sandbox: the repository is writable, `.git/` and `.github/workflows/` are read-only, there is no outbound or local network access, and `allow_bypass=False`. **No sandbox, no shell**: where the sandbox is unavailable, the implementer gets no `bash` tool and cannot run tests.
-
-- **Linux**: the action installs bubblewrap (0.5.0 or later) if needed, lifts Ubuntu 24.04's AppArmor restriction on unprivileged user namespaces when necessary, and probes that bubblewrap works.
-- **macOS**: uses the built-in Seatbelt sandbox.
-- **Windows or a failed probe**: no sandbox, so no shell; the log and the job summary say so.
-
-Because the sandbox has no network, install what your tests need before the action runs (see the [workflow example](#1-create-the-workflow-file)).
-
-### Around the Agent
-
-- **No token in the agent's reach**: before the in-process runtime starts, credentials are removed from the process environment, and the action removes any credential `actions/checkout` persisted in `.git/config`. The Copilot token is passed per session rather than to the client, because the SDK hands a client-level token to the in-process runtime as an environment variable that the agent's shell would inherit. The GitHub token only reaches the `gh` and `git` processes that need it.
-- **Publishing checks**: the action stages the changes itself and refuses empty changes, workflow files (renames included) and more than `max-files-changed` files. It refuses to publish if the repository's git configuration changed during the run, and runs git with hooks disabled.
-- **Untrusted input**: issue text, comments and feedback are fenced as user content in the prompts, and only plans posted by the action itself count, so nobody can forge a plan comment.
-- **Loop protection**: every comment the action posts carries a marker, and the action ignores comments with that marker, even when `github-token` is a personal token.
-- **Budget and time**: `max-ai-credits` sets a soft cap per session (checked between model calls, so one response can exceed it; the runtime also tells the model its budget). If the budget runs out, the action answers the runtime's request with *cancel*. `timeout-minutes` bounds every run.
-
-## Durable Sessions
-
-Each issue has one Copilot session, `copilot-issue-<number>`. The plan phase creates it with `create_session(session_id=...)`; refine and implement continue it with `resume_session(...)` and switch to their agent with `session.rpc.agent.select(...)`, so the implementer starts with everything the planner learned. Between workflow runs, the session state (`<runner temp>/copilot-agent-home/session-state`) is stored with `actions/cache`, which needs `cache-mode: write` in the workflow.
-
-If the cache is missing (no `cache-mode: write`, or eviction after 7 days without access), the agent starts a fresh session with the issue in the prompt. Nothing breaks: the latest plan is always part of the prompt.
 
 ## Labels Lifecycle
 
