@@ -265,19 +265,20 @@ flowchart LR
     style SB stroke:#8957e5,stroke-width:2px
 ```
 
-Verified by running commands through the agent's sandboxed shell with the action's own configuration (`session.rpc.shell.execute_user_requested`, no model involved):
+Verified on GitHub-hosted runners by running the action's own *Prepare sandbox* step, then commands through the agent's sandboxed shell with the action's own configuration (`session.rpc.shell.execute_user_requested`, no model involved):
 
-| Inside the sandbox | `ubuntu-latest` runner (bubblewrap 0.11.1) | macOS (Seatbelt) |
+| Inside the sandbox | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` (bubblewrap) | `macos-latest` (Seatbelt) |
 |---|---|---|
 | `git status`, writing a file in the repository | ✅ works | ✅ works |
 | Writing to `.git/` or `.github/workflows/` | ❌ `Read-only file system` | ❌ `Operation not permitted` |
 | `curl https://api.github.com` | ❌ `Could not resolve host` | ❌ `Could not resolve host` |
 | Token or secret variables in `env` | none | none |
 | Home directory | only `.cache`, `.cargo`, `.dotnet`, `.local` and `work` visible | not readable |
+| Writing to `/tmp` | ✅ works | ❌ `Operation not permitted` |
 
 **No sandbox, no shell**: where the sandbox is unavailable, the implementer gets no `bash` tool and cannot run tests.
 
-- **Linux**: bubblewrap 0.5.0 or later. `ubuntu-latest` ships it; elsewhere the action installs it, lifts Ubuntu 24.04's AppArmor restriction on unprivileged user namespaces when necessary, and checks that bubblewrap works.
+- **Linux**: bubblewrap 0.5.0 or later. The action installs it when it is missing, lifts Ubuntu's AppArmor restriction on unprivileged user namespaces when bubblewrap needs that, and checks that bubblewrap works. On `ubuntu-latest` bubblewrap 0.11.1 is preinstalled and works as is; on `ubuntu-24.04` the action installed 0.9.0 and lifted the restriction; on `ubuntu-22.04` it installed 0.6.1.
 - **macOS**: the built-in Seatbelt sandbox.
 - **Windows or a failed check**: no sandbox, so no shell; the log and the job summary say so.
 
