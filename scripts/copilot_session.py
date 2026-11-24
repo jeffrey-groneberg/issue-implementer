@@ -3,7 +3,8 @@
 The action asks the SDK for a locked-down agent instead of building guardrails itself:
 
 - CopilotClient(mode="empty"): no ambient tools, files or instructions. The runtime runs
-  in this process (RuntimeConnection.for_default) and uses an explicit token.
+  in this process (RuntimeConnection.for_default) and has no identity of its own; each
+  session gets the token through github={"token": ...}.
 - agents.definitions / agents.selected: an Issue Planner and an Issue Implementer, each
   with its own tool list and a preloaded skill from skills.directories.
 - tools.available_tools: only the selected agent's tools are exposed.
@@ -268,6 +269,9 @@ async def run_agent(settings, phase: str, prompt: str, tools: list, context: str
         "tools": {"definitions": tools, "available_tools": available_tools(agent)},
         "permissions": permissions,
         "events": {"on_event": event_logger(run, session_ref, asyncio.get_running_loop())},
+        # Session-scoped identity: a client-level token would reach the runtime as an
+        # environment variable, which the agent's shell inherits.
+        "github": {"token": settings.copilot_token},
     }
     if settings.model:
         options["model"] = settings.model
@@ -282,7 +286,7 @@ async def run_agent(settings, phase: str, prompt: str, tools: list, context: str
     client = CopilotClient(
         mode="empty",
         runtime=RuntimeConnection.for_default(base_directory=settings.copilot_home),
-        github={"token": settings.copilot_token, "use_logged_in_user": False},
+        github={"use_logged_in_user": False},
     )
     async with client:
         session, run.resumed = await open_session(client, settings.session_id, phase != "plan",

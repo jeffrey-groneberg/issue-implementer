@@ -19,7 +19,7 @@ Version 2.0 moves from the GitHub Copilot SDK 0.2 to the **Microsoft Copilot SDK
 |---|---|---|
 | In-process runtime | `CopilotClient(runtime=RuntimeConnection.for_default(base_directory=...))` | The runtime runs inside the Python process: no Node.js, no npm, no Copilot CLI install |
 | Empty client mode | `CopilotClient(mode="empty")` | No ambient tools, files or instructions; every session opts in explicitly |
-| Workflow token | `github={"token": ..., "use_logged_in_user": False}` | The workflow `GITHUB_TOKEN` with `copilot-requests: write` makes the Copilot requests; a PAT is optional |
+| Session identity | `CopilotClient(github={"use_logged_in_user": False})`, `create_session(github={"token": ...})` | The workflow `GITHUB_TOKEN` with `copilot-requests: write` makes the Copilot requests (a PAT is optional). The runtime has no identity of its own; the token goes to each session over the SDK connection |
 | Custom agents | `agents={"definitions": [...], "selected": ...}`, `session.rpc.agent.select(...)` | `issue-planner` (read-only) and `issue-implementer`, each with its own tools and preloaded skill |
 | Skills | `skills={"enabled": True, "directories": [...]}` | The plan format and implementation rules live in [`skills/`](skills) |
 | Repository instructions | `instructions={"skip_custom_instructions": False}` | The repository's own `.github/copilot-instructions.md` and `AGENTS.md` apply |
@@ -326,7 +326,7 @@ Because the sandbox has no network, install what your tests need before the acti
 
 ### Around the Agent
 
-- **No token in the agent's reach**: before the in-process runtime starts, credentials are removed from the process environment, and the action removes any credential `actions/checkout` persisted in `.git/config`. The token only reaches the `gh` and `git` processes that need it.
+- **No token in the agent's reach**: before the in-process runtime starts, credentials are removed from the process environment, and the action removes any credential `actions/checkout` persisted in `.git/config`. The Copilot token is passed per session rather than to the client, because the SDK hands a client-level token to the in-process runtime as an environment variable that the agent's shell would inherit. The GitHub token only reaches the `gh` and `git` processes that need it.
 - **Publishing checks**: the action stages the changes itself and refuses empty changes, workflow files (renames included) and more than `max-files-changed` files. It refuses to publish if the repository's git configuration changed during the run, and runs git with hooks disabled.
 - **Untrusted input**: issue text, comments and feedback are fenced as user content in the prompts, and only plans posted by the action itself count, so nobody can forge a plan comment.
 - **Loop protection**: every comment the action posts carries a marker, and the action ignores comments with that marker, even when `github-token` is a personal token.
