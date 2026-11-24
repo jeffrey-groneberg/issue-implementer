@@ -1,25 +1,45 @@
 name: 'Copilot Issue Agent'
-description: 'Label-to-PR Autopilot — analyze issues, create plans, refine via dialog, implement and open PRs using GitHub Copilot SDK.'
+description: 'Label-to-PR autopilot on the Microsoft Copilot SDK 2.0: plan an issue, refine the plan in comments, implement it and open a draft PR.'
 branding:
   icon: 'cpu'
   color: 'purple'
 
 inputs:
-  copilot-pat:
-    description: 'Fine-Grained PAT with Copilot Requests permission'
-    required: true
+  github-token:
+    description: 'Token for issue and pull request operations, also used for Copilot requests unless copilot-token is set. With the default GITHUB_TOKEN, grant the workflow "copilot-requests: write".'
+    default: ${{ github.token }}
+  copilot-token:
+    description: 'Optional token used only for Copilot requests, for example a fine-grained PAT with the "Copilot Requests" permission.'
+    default: ''
   model:
-    description: 'Copilot model to use'
-    default: 'gpt-5.2'
+    description: 'Copilot model ID, for example claude-sonnet-5.5, or "auto" to let Copilot choose.'
+    default: 'auto'
+  reasoning-effort:
+    description: 'Reasoning effort for a pinned model: low, medium, high, xhigh or max. Empty uses the model default.'
+    default: ''
   max-files-changed:
-    description: 'Maximum files the agent may change during implementation'
+    description: 'Maximum number of files one implementation may change.'
     default: '10'
   timeout-minutes:
-    description: 'Timeout for agent session in minutes'
+    description: 'Timeout for one agent run in minutes.'
     default: '15'
-  reasoning-effort:
-    description: 'Reasoning effort level (low, medium, high, xhigh)'
-    default: 'high'
+  max-ai-credits:
+    description: 'Soft AI credit budget per Copilot session (execution.limits.max_ai_credits, experimental). Minimum 30; empty means no budget.'
+    default: ''
+
+outputs:
+  mode:
+    description: 'Detected mode: plan, refine, implement, cancel or skip.'
+    value: ${{ steps.detect.outputs.mode }}
+  session-id:
+    description: 'ID of the Copilot session for this issue.'
+    value: ${{ steps.agent.outputs.session-id }}
+  ai-credits:
+    description: 'AI credits this run used, from the session usage metrics (experimental).'
+    value: ${{ steps.agent.outputs.ai-credits }}
+  pull-request-url:
+    description: 'URL of the draft pull request opened by the implement phase.'
+    value: ${{ steps.agent.outputs.pull-request-url }}
 
 runs:
   using: 'composite'
@@ -31,40 +51,49 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         LABEL_NAME: ${{ github.event.label.name }}
         COMMENT_BODY: ${{ github.event.comment.body }}
-        ACTOR: ${{ github.actor }}
+        COMMENT_USER: ${{ github.event.comment.user.login }}
+        COMMENT_USER_TYPE: ${{ github.event.comment.user.type }}
+        AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
         ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
         ISSUE_STATE: ${{ github.event.issue.state }}
+        IS_PULL_REQUEST: ${{ github.event.issue.pull_request != null }}
       run: |
         MODE="skip"
+        has_label() { [[ ",$ISSUE_LABELS," == *",$1,"* ]]; }
+        COMMAND="$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
         if [[ "$ISSUE_STATE" != "open" ]]; then
-          echo "::notice::Issue is not open (state=$ISSUE_STATE) — skipping"
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
-        if [[ "$EVENT_NAME" == "issues" && "$LABEL_NAME" == "copilot" ]]; then
-          if [[ "$ISSUE_LABELS" != *"copilot:plan"* && "$ISSUE_LABELS" != *"copilot:working"* ]]; then
+          echo "::notice::Issue is not open (state=$ISSUE_STATE), skipping"
+        elif [[ "$IS_PULL_REQUEST" == "true" ]]; then
+          echo "::notice::Comment is on a pull request, skipping"
+        elif [[ "$EVENT_NAME" == "issues" ]]; then
+          if [[ "$LABEL_NAME" == "copilot" ]] && ! has_label "copilot:plan" && ! has_label "copilot:working"; then
             MODE="plan"
           fi
-        elif [[ "$EVENT_NAME" == "issue_comment" && "$ACTOR" != "github-actions[bot]" ]]; then
-          if [[ "$COMMENT_BODY" == "/implement" && "$ISSUE_LABELS" == *"copilot:plan"* ]]; then
-            MODE="implement"
-          elif [[ "$COMMENT_BODY" == "/cancel" ]]; then
-            MODE="cancel"
-          elif [[ "$ISSUE_LABELS" == *"copilot:plan"* ]]; then
+        elif [[ "$EVENT_NAME" == "issue_comment" ]]; then
+          if [[ "$COMMENT_USER_TYPE" == "Bot" || "$COMMENT_BODY" == *"<!-- copilot-issue-agent -->"* ]]; then
+            echo "::notice::Comment from the agent or a bot, skipping"
+          elif [[ "$AUTHOR_ASSOCIATION" != "OWNER" && "$AUTHOR_ASSOCIATION" != "MEMBER" && "$AUTHOR_ASSOCIATION" != "COLLABORATOR" ]]; then
+            echo "::notice::Ignoring comment by $COMMENT_USER ($AUTHOR_ASSOCIATION): only owners, members and collaborators can drive the agent"
+          elif [[ "$COMMAND" == "/implement" ]]; then
+            if has_label "copilot:plan"; then MODE="implement"; fi
+          elif [[ "$COMMAND" == "/cancel" ]]; then
+            if has_label "copilot" || has_label "copilot:plan" || has_label "copilot:working" || has_label "copilot:failed"; then
+              MODE="cancel"
+            fi
+          elif has_label "copilot:plan"; then
             MODE="refine"
           fi
         fi
 
         echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-        echo "::notice::Copilot Agent mode: $MODE"
+        echo "::notice::Copilot Issue Agent mode: $MODE"
 
     - name: Ensure labels exist
       if: steps.detect.outputs.mode != 'skip'
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
+        GH_TOKEN: ${{ inputs.github-token }}
         REPO: ${{ github.repository }}
       run: |
         declare -A LABELS=(
@@ -76,60 +105,110 @@ runs:
         )
         for label in "${!LABELS[@]}"; do
           IFS=: read -r color desc <<< "${LABELS[$label]}"
-          gh label create "$label" --repo "$REPO" --color "$color" --description "$desc" 2>/dev/null || true
+          gh label create "$label" --repo "$REPO" --color "$color" --description "$desc" >/dev/null 2>&1 || true
         done
 
-    - name: Setup Python
-      if: steps.detect.outputs.mode != 'skip' && steps.detect.outputs.mode != 'cancel'
+    - name: Set up Python
+      id: python
+      if: contains(fromJSON('["plan","refine","implement"]'), steps.detect.outputs.mode)
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: '3.12'
+        # Keep the job's PATH: the agent's shell uses the caller's toolchain.
+        update-environment: false
 
-    - name: Setup Node
-      if: steps.detect.outputs.mode != 'skip' && steps.detect.outputs.mode != 'cancel'
-      uses: actions/setup-node@v4
-      with:
-        node-version: '22'
-
-    - name: Install dependencies
-      if: steps.detect.outputs.mode != 'skip' && steps.detect.outputs.mode != 'cancel'
+    - name: Install Microsoft Copilot SDK
+      if: contains(fromJSON('["plan","refine","implement"]'), steps.detect.outputs.mode)
       shell: bash
+      env:
+        PYTHON: ${{ steps.python.outputs.python-path }}
       run: |
-        pip install -r "${{ github.action_path }}/requirements.txt"
-        npm install -g @github/copilot@1.0.25
+        "$PYTHON" -m venv "$RUNNER_TEMP/copilot-agent-venv"
+        VENV_PYTHON="$RUNNER_TEMP/copilot-agent-venv/bin/python"
+        "$VENV_PYTHON" -m pip install --disable-pip-version-check --quiet -r "$GITHUB_ACTION_PATH/requirements.txt"
+        "$VENV_PYTHON" -m copilot download-runtime --in-process
 
-    - name: Configure Git
+    - name: Prepare sandbox
+      id: sandbox
       if: steps.detect.outputs.mode == 'implement'
       shell: bash
       run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+        STATUS="unavailable"
+        probe() { bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent true >/dev/null 2>&1; }
+        case "$RUNNER_OS" in
+          Linux)
+            if ! command -v bwrap >/dev/null 2>&1; then
+              sudo -n apt-get install -y -qq bubblewrap >/dev/null 2>&1 \
+                || { sudo -n apt-get update -qq >/dev/null 2>&1 && sudo -n apt-get install -y -qq bubblewrap >/dev/null 2>&1; } \
+                || true
+            fi
+            if command -v bwrap >/dev/null 2>&1; then
+              # Ubuntu 24.04 restricts unprivileged user namespaces, which bubblewrap needs.
+              if ! probe && [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" == "1" ]]; then
+                sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 >/dev/null 2>&1 || true
+              fi
+              if probe; then STATUS="on"; fi
+            fi
+            ;;
+          macOS)
+            STATUS="on"
+            ;;
+        esac
+        echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+        if [[ "$STATUS" == "on" ]]; then
+          echo "::notice::Sandbox available on $RUNNER_OS: the implementer gets a sandboxed shell"
+        else
+          echo "::warning::No sandbox on this $RUNNER_OS runner: the implementer runs without a shell and cannot run tests"
+        fi
 
-    - name: Run Agent
-      if: steps.detect.outputs.mode != 'skip'
+    - name: Restore agent session
+      if: steps.detect.outputs.mode == 'refine' || steps.detect.outputs.mode == 'implement'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/copilot-agent-home/session-state
+        key: copilot-session-${{ github.repository_id }}-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          copilot-session-${{ github.repository_id }}-${{ github.event.issue.number }}-
+
+    - name: Run agent
+      id: agent
+      if: contains(fromJSON('["plan","refine","implement"]'), steps.detect.outputs.mode)
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
-        COPILOT_PAT: ${{ inputs.copilot-pat }}
-        GITHUB_REPOSITORY: ${{ github.repository }}
-        GITHUB_SERVER_URL: ${{ github.server_url }}
-        GH_HOST: ${{ github.event.repository.owner.login != '' && 'github.com' || github.server_url }}
+        MODE: ${{ steps.detect.outputs.mode }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        COPILOT_TOKEN: ${{ inputs.copilot-token }}
         ISSUE_NUMBER: ${{ github.event.issue.number }}
         COMMENT_BODY: ${{ github.event.comment.body }}
         COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+        COMMENT_ID: ${{ github.event.comment.id }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         MODEL: ${{ inputs.model }}
+        REASONING_EFFORT: ${{ inputs.reasoning-effort }}
         MAX_FILES_CHANGED: ${{ inputs.max-files-changed }}
         TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
-        REASONING_EFFORT: ${{ inputs.reasoning-effort }}
+        MAX_AI_CREDITS: ${{ inputs.max-ai-credits }}
+        SANDBOX_STATUS: ${{ steps.sandbox.outputs.status }}
+        COPILOT_AGENT_HOME: ${{ runner.temp }}/copilot-agent-home
         AGENT_ROOT: ${{ github.action_path }}
+      run: '"$RUNNER_TEMP/copilot-agent-venv/bin/python" "$AGENT_ROOT/scripts/agent.py" "$MODE"'
+
+    - name: Cancel
+      if: steps.detect.outputs.mode == 'cancel'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ISSUE_NUMBER: ${{ github.event.issue.number }}
       run: |
-        case "${{ steps.detect.outputs.mode }}" in
-          plan)      python "${{ github.action_path }}/scripts/plan_issue.py" ;;
-          refine)    python "${{ github.action_path }}/scripts/refine_plan.py" ;;
-          implement) python "${{ github.action_path }}/scripts/implement_issue.py" ;;
-          cancel)
-            gh issue edit "$ISSUE_NUMBER" --remove-label copilot,copilot:plan,copilot:working 2>/dev/null || true
-            gh issue comment "$ISSUE_NUMBER" --body "🚫 Copilot Agent cancelled."
-            ;;
-        esac
+        export GH_HOST="${GITHUB_SERVER_URL#*://}" GH_ENTERPRISE_TOKEN="$GH_TOKEN"
+        gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+          --remove-label copilot --remove-label copilot:plan --remove-label copilot:working --remove-label copilot:failed >/dev/null || true
+        gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+          --body "$(printf '<!-- copilot-issue-agent -->\n🚫 Copilot Issue Agent cancelled.')"
+
+    - name: Save agent session
+      if: always() && contains(fromJSON('["plan","refine","implement"]'), steps.detect.outputs.mode)
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/copilot-agent-home/session-state
+        key: copilot-session-${{ github.repository_id }}-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}

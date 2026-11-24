@@ -1,2 +1,1 @@
-github-copilot-sdk==0.2.0
-PyYAML
+microsoft-copilot-sdk==2.0.1
