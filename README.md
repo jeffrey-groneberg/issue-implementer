@@ -20,12 +20,12 @@ Version 2.0 moves from the GitHub Copilot SDK 0.2 to the **Microsoft Copilot SDK
 | In-process runtime | `CopilotClient(runtime=RuntimeConnection.for_default(base_directory=...))` | The runtime runs inside the Python process: no Node.js, no npm, no Copilot CLI install |
 | Empty client mode | `CopilotClient(mode="empty")` | No ambient tools, files or instructions; every session opts in explicitly |
 | Session identity | `CopilotClient(github={"use_logged_in_user": False})`, `create_session(github={"token": ...})` | The workflow `GITHUB_TOKEN` with `copilot-requests: write` makes the Copilot requests (a PAT is optional). The runtime has no identity of its own; the token goes to each session over the SDK connection |
-| Custom agents | `agents={"definitions": [...], "selected": ...}`, `session.rpc.agent.select(...)` | `issue-planner` (read-only) and `issue-implementer`, each with its own tools and preloaded skill |
+| Custom agents | `agents={"definitions": [...], "selected": ...}`, `session.rpc.agent.select(...)` *(experimental)* | `issue-planner` (read-only) and `issue-implementer`, each with its own tools and preloaded skill |
 | Skills | `skills={"enabled": True, "directories": [...]}` | The plan format and implementation rules live in [`skills/`](skills) |
 | Repository instructions | `instructions={"skip_custom_instructions": False}` | The repository's own `.github/copilot-instructions.md` and `AGENTS.md` apply |
 | Tool allow-list | `tools={"available_tools": ToolSet()...}` | Only the selected agent's tools exist, for example `builtin:view` and `custom:submit_plan` |
 | Custom tools | `define_tool(..., is_terminal=True, skip_permission=True)` | `submit_plan` and `submit_pull_request` hand results back and end the turn |
-| Permission policy | `permissions={"on_request": ...}` with typed requests | Reads stay in the repository; writes stay out of `.git/` and `.github/workflows/`; everything else is rejected |
+| Permission policy | `permissions={"on_request": ...}` with typed requests; decisions `PermissionDecisionApproveOnce` and `PermissionDecisionReject` *(experimental types)* | Reads stay in the repository; writes stay out of `.git/` and `.github/workflows/`; everything else is rejected |
 | Sandbox *(experimental)* | `permissions={"sandbox": SandboxConfig(...)}` | The implementer's shell has no network access and a read-only `.git/` |
 | Session events | `events={"on_event": ...}` | Tool calls, the model Copilot picked for `auto`, and messages stream into the job log |
 | Durable sessions | `create_session(session_id=...)`, `resume_session(...)` | One conversation per issue: refine and implement resume the planning session |
@@ -162,7 +162,7 @@ sequenceDiagram
 
 ## Custom Agents
 
-The action defines two custom agents with `agents.definitions`. Both live in every session, so a resumed conversation always knows them; each phase selects the one it needs. A new session selects it with `agents.selected`. A resumed session keeps the agent it last used, so the action switches with `session.rpc.agent.select(...)`.
+The action defines two custom agents with `agents.definitions`. Both live in every session, so a resumed conversation always knows them; each phase selects the one it needs. A new session selects it with `agents.selected`. A resumed session keeps the agent it last used, so the action switches with `session.rpc.agent.select(...)` (experimental).
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 320}}}%%
@@ -310,11 +310,11 @@ flowchart TB
 - **Publishing checks**: the action stages the changes itself and refuses empty changes, workflow files (renames included) and more than `max-files-changed` files. It refuses to publish if the repository's git configuration changed during the run, and runs git with hooks disabled.
 - **Untrusted input**: issue text, comments and feedback are fenced as user content in the prompts, and only plans posted by the action itself count, so nobody can forge a plan comment.
 - **Loop protection**: every comment the action posts carries a marker, and the action ignores comments with that marker, even when `github-token` is a personal token.
-- **Budget and time**: `max-ai-credits` sets a soft cap per session (checked between model calls, so one response can exceed it; the runtime also tells the model its budget). If the budget runs out, the action answers the runtime's request with *cancel*. `timeout-minutes` bounds every run.
+- **Budget and time**: `max-ai-credits` sets a soft cap per session (checked between model calls, so one response can exceed it; the runtime also tells the model its budget). If the budget runs out, the action answers the runtime's request with *cancel* (`session.rpc.ui.handle_pending_session_limits_exhausted`, experimental). `timeout-minutes` bounds every run.
 
 ## Durable Sessions
 
-Each issue has one Copilot session, `copilot-issue-<number>`. The plan phase creates it with `create_session(session_id=...)`; refine and implement continue it with `resume_session(...)` and switch to their agent with `session.rpc.agent.select(...)`, so the implementer starts with everything the planner learned. Between workflow runs, the session state (`<runner temp>/copilot-agent-home/session-state`) is stored with `actions/cache`, which needs `cache-mode: write` in the workflow.
+Each issue has one Copilot session, `copilot-issue-<number>`. The plan phase creates it with `create_session(session_id=...)`; refine and implement continue it with `resume_session(...)` and switch to their agent with `session.rpc.agent.select(...)` (experimental), so the implementer starts with everything the planner learned. Between workflow runs, the session state (`<runner temp>/copilot-agent-home/session-state`) is stored with `actions/cache`, which needs `cache-mode: write` in the workflow. Cache entries cannot be overwritten, so each run saves a new entry, `copilot-session-<issue>-<run id>-<attempt>`, and the next run restores the newest entry with the prefix `copilot-session-<issue>-`.
 
 ```mermaid
 sequenceDiagram

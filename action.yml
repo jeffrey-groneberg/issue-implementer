@@ -161,14 +161,16 @@ runs:
           echo "::warning::No sandbox on this $RUNNER_OS runner: the implementer runs without a shell and cannot run tests"
         fi
 
+    # Cache entries cannot be overwritten, so every run saves a new one (run ID + attempt)
+    # and the next run restores the newest entry for the issue through the key prefix.
     - name: Restore agent session
       if: steps.detect.outputs.mode == 'refine' || steps.detect.outputs.mode == 'implement'
       uses: actions/cache/restore@v6
       with:
         path: ${{ runner.temp }}/copilot-agent-home/session-state
-        key: copilot-session-${{ github.repository_id }}-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: copilot-session-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: |
-          copilot-session-${{ github.repository_id }}-${{ github.event.issue.number }}-
+          copilot-session-${{ github.event.issue.number }}-
 
     - name: Run agent
       id: agent
@@ -211,4 +213,4 @@ runs:
       uses: actions/cache/save@v6
       with:
         path: ${{ runner.temp }}/copilot-agent-home/session-state
-        key: copilot-session-${{ github.repository_id }}-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: copilot-session-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
