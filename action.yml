@@ -111,7 +111,7 @@ runs:
     - name: Set up Python
       id: python
       if: contains(fromJSON('["plan","refine","implement"]'), steps.detect.outputs.mode)
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: '3.12'
         # Keep the job's PATH: the agent's shell uses the caller's toolchain.
@@ -163,7 +163,7 @@ runs:
 
     - name: Restore agent session
       if: steps.detect.outputs.mode == 'refine' || steps.detect.outputs.mode == 'implement'
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: ${{ runner.temp }}/copilot-agent-home/session-state
         key: copilot-session-${{ github.repository_id }}-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -208,7 +208,7 @@ runs:
 
     - name: Save agent session
       if: always() && contains(fromJSON('["plan","refine","implement"]'), steps.detect.outputs.mode)
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       with:
         path: ${{ runner.temp }}/copilot-agent-home/session-state
         key: copilot-session-${{ github.repository_id }}-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}

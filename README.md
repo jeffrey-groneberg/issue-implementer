@@ -154,6 +154,8 @@ permissions:
   pull-requests: write     # open the draft pull request
   copilot-requests: write  # let GITHUB_TOKEN call Copilot
 
+cache-mode: write          # keep each issue's Copilot session between runs
+
 concurrency:
   group: copilot-issue-${{ github.event.issue.number }}
   cancel-in-progress: false
@@ -163,12 +165,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false   # keep the token out of .git/config
 
       # Optional: install what your tests need. The agent's sandbox has no network.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: pip install -r requirements-dev.txt
@@ -178,7 +180,7 @@ jobs:
           max-ai-credits: '300'
 ```
 
-The action detects the mode (plan, refine, implement, cancel or skip) and only runs the agent when relevant. The `concurrency` group keeps runs for the same issue in order, which the durable session relies on. This repository's own [workflow](.github/workflows/copilot-agent.yml) also skips runner start-up for unrelated comments.
+The action detects the mode (plan, refine, implement, cancel or skip) and only runs the agent when relevant. The `concurrency` group keeps runs for the same issue in order, which the durable session relies on. Issue events get read-only cache access by default, so [`cache-mode: write`](https://docs.github.com/actions/reference/workflows-and-actions/workflow-syntax#cache-mode) lets the action save the session; GitHub shows a warning annotation for it. The action only saves the cache in runs that a maintainer started. This repository's own [workflow](.github/workflows/copilot-agent.yml) also skips runner start-up for unrelated comments.
 
 ### 2. Allow Actions to Create Pull Requests
 
@@ -334,9 +336,9 @@ Because the sandbox has no network, install what your tests need before the acti
 
 ## Durable Sessions
 
-Each issue has one Copilot session, `copilot-issue-<number>`. The plan phase creates it with `create_session(session_id=...)`; refine and implement continue it with `resume_session(...)` and switch to their agent with `session.rpc.agent.select(...)`, so the implementer starts with everything the planner learned. Between workflow runs, the session state (`<runner temp>/copilot-agent-home/session-state`) is stored with `actions/cache`.
+Each issue has one Copilot session, `copilot-issue-<number>`. The plan phase creates it with `create_session(session_id=...)`; refine and implement continue it with `resume_session(...)` and switch to their agent with `session.rpc.agent.select(...)`, so the implementer starts with everything the planner learned. Between workflow runs, the session state (`<runner temp>/copilot-agent-home/session-state`) is stored with `actions/cache`, which needs `cache-mode: write` in the workflow.
 
-If the cache is missing (first run, or eviction after 7 days without access), the agent starts a fresh session with the issue in the prompt. Nothing breaks: the latest plan is always part of the prompt.
+If the cache is missing (no `cache-mode: write`, or eviction after 7 days without access), the agent starts a fresh session with the issue in the prompt. Nothing breaks: the latest plan is always part of the prompt.
 
 ## Labels Lifecycle
 
@@ -401,7 +403,7 @@ tests/                        ← Unit tests: permission policy, tools, publishi
 1. Remove the `COPILOT_PAT` secret from the workflow and add `copilot-requests: write` to its `permissions` (or pass the PAT as `copilot-token`; `copilot-pat` is gone).
 2. Remove the Node.js and Copilot CLI setup if you added it yourself; the SDK brings its runtime.
 3. Move the settings from `.github/copilot-agent.yml` to action inputs, and `additional_instructions` to `.github/copilot-instructions.md`. `extra_allowed_commands`, `max_refinement_rounds` and the custom trigger names are gone: the sandbox replaces the command allowlist, and `max-ai-credits` bounds the cost.
-4. Set `persist-credentials: false` on `actions/checkout`, and install your test dependencies before the action, because the sandbox has no network.
+4. Set `persist-credentials: false` on `actions/checkout`, add `cache-mode: write`, and install your test dependencies before the action, because the sandbox has no network.
 
 ## Development
 
